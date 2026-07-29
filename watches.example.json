@@ -1,0 +1,15 @@
+{
+  "watches": [
+    {
+      "id": "a1b2c3d4",
+      "label": "Competitor A — Widget Pro",
+      "url": "https://example.com/products/widget-pro"
+    },
+    {
+      "id": "e5f6a7b8",
+      "label": "Competitor B — Widget Pro",
+      "url": "https://example.net/shop/widget-pro",
+      "priceRegex": "class=\"price\">\\$([0-9.,]+)"
+    }
+  ]
+}

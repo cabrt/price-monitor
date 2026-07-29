@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Price Monitor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: { zinc: { 950: '#09090b' } }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Viz roles. Validated against the zinc-950 surface:
+       series blue passes all six checks; good/critical clear 3:1 contrast but
+       collide under deuteranopia, so they never carry meaning without an
+       arrow glyph and a text label beside them. */
+    :root {
+      --surface:        #09090b;
+      --series-1:       #3987e5;
+      --status-good:    #0ca30c;
+      --status-critical:#d03b3b;
+      --text-primary:   #f4f4f5;
+      --text-secondary: #a1a1aa;
+      --text-muted:     #898781;
+      --gridline:       #2c2c2a;
+    }
+    .tnum { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="bg-zinc-950 text-zinc-100 min-h-screen antialiased">
+  <div id="app" class="max-w-6xl mx-auto px-6 py-10"></div>
+
+  <script>
+    let watches = []
+    let generatedAt = null
+    let sortKey = 'label'
+
+    const fmtPrice = (n, currency) =>
+      n == null ? '—' : new Intl.NumberFormat('en-US', {
+        style: 'currency', currency: currency || 'USD'
+      }).format(n)
+
+    function relTime(iso) {
+      if (!iso) return 'never'
+      const mins = Math.round((Date.now() - new Date(iso)) / 60000)
+      if (mins < 1) return 'just now'
+      if (mins < 60) return `${mins}m ago`
+      const hrs = Math.round(mins / 60)
+      if (hrs < 24) return `${hrs}h ago`
+      return `${Math.round(hrs / 24)}d ago`
+    }
+
+    // --- Sparkline -------------------------------------------------------
+    // Single series, so no legend: the row label names it. 2px stroke,
+    // recessive baseline, current value direct-labeled in the price column
+    // rather than on the mark.
+    function sparkline(history, id) {
+      const pts = history.filter(h => h.price != null)
+      if (pts.length < 2) {
+        return `<span class="text-xs" style="color:var(--text-muted)">not enough data</span>`
+      }
+
+      const W = 140, H = 32, PAD = 3
+      const prices = pts.map(p => p.price)
+      const min = Math.min(...prices)
+      const max = Math.max(...prices)
+      const span = max - min || 1
+
+      const coords = pts.map((p, i) => [
+        PAD + (i / (pts.length - 1)) * (W - PAD * 2),
+        PAD + (1 - (p.price - min) / span) * (H - PAD * 2),
+      ])
+
+      const path = coords.map((c, i) => `${i === 0 ? 'M' : 'L'}${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(' ')
+      const [lx, ly] = coords[coords.length - 1]
+
+      // Readings are far denser than the pixel width, so per-point hit targets
+      // would overlap and occlude each other. A single overlay resolves the
+      // nearest point from the pointer's x instead — works at any density.
+      return `
+        <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" class="overflow-visible cursor-crosshair"
+             data-spark="${id}" role="img"
+             aria-label="Price trend, ${pts.length} readings, ${fmtPrice(min)} to ${fmtPrice(max)}">
+          <line x1="0" y1="${H - 0.5}" x2="${W}" y2="${H - 0.5}"
+                stroke="var(--gridline)" stroke-width="1"/>
+          <path d="${path}" fill="none" stroke="var(--series-1)" stroke-width="2"
+                stroke-linejoin="round" stroke-linecap="round"/>
+          <circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="3"
+                  fill="var(--series-1)" stroke="var(--surface)" stroke-width="2"/>
+          <line data-crosshair class="hidden" y1="0" y2="${H}"
+                stroke="var(--text-muted)" stroke-width="1"/>
+          <circle data-marker class="hidden" r="3.5"
+                  fill="var(--series-1)" stroke="var(--surface)" stroke-width="2"/>
+          <rect data-hit width="${W}" height="${H}" x="0" y="0" fill="transparent"/>
+        </svg>`
+    }
+
+    // --- Delta: arrow + label + color, never color alone -----------------
+    function deltaCell(w) {
+      const cur = w.current, prev = w.previous
+      if (!cur || !prev || cur.price == null || prev.price == null) {
+        return `<span class="text-xs" style="color:var(--text-muted)">—</span>`
+      }
+
+      const delta = cur.price - prev.price
+      if (delta === 0) {
+        return `<span class="text-xs" style="color:var(--text-muted)">no change</span>`
+      }
+
+      const down = delta < 0
+      const pct = prev.price ? (delta / prev.price) * 100 : 0
+      const color = down ? 'var(--status-good)' : 'var(--status-critical)'
+
+      return `
+        <span class="inline-flex items-center gap-1.5 text-sm tnum" style="color:${color}">
+          <span aria-hidden="true">${down ? '↓' : '↑'}</span>
+          <span>${down ? '' : '+'}${pct.toFixed(1)}%</span>
+          <span class="text-xs" style="color:var(--text-secondary)">
+            ${down ? 'dropped' : 'rose'} ${fmtPrice(Math.abs(delta), cur.currency)}
+          </span>
+        </span>`
+    }
+
+    // --- Stock badge: icon + label -------------------------------------
+    function stockCell(w) {
+      const a = w.current?.availability
+      if (!a) return `<span class="text-xs" style="color:var(--text-muted)">unknown</span>`
+
+      const out = a === 'out_of_stock'
+      const color = out ? 'var(--status-critical)' : 'var(--status-good)'
+      return `
+        <span class="inline-flex items-center gap-1.5 text-xs" style="color:${color}">
+          <span aria-hidden="true">${out ? '●' : '○'}</span>
+          <span>${out ? 'Out of stock' : 'In stock'}</span>
+        </span>`
+    }
+
+    // --- Stat tiles: headline numbers, no plot --------------------------
+    function statTiles() {
+      const tracked = watches.length
+      const withData = watches.filter(w => w.current)
+      const outOfStock = withData.filter(w => w.current.availability === 'out_of_stock').length
+      const moved = watches.filter(w =>
+        w.current && w.previous && w.current.price !== w.previous.price
+      ).length
+
+      const drops = watches
+        .filter(w => w.current && w.previous && w.current.price < w.previous.price)
+        .map(w => ((w.current.price - w.previous.price) / w.previous.price) * 100)
+      const deepest = drops.length ? Math.min(...drops) : null
+
+      const tiles = [
+        { label: 'Tracked', value: tracked, sub: `${withData.length} with readings` },
+        { label: 'Changed last check', value: moved, sub: moved === 1 ? 'product' : 'products' },
+        { label: 'Out of stock', value: outOfStock, sub: 'across all watches' },
+        {
+          label: 'Deepest drop',
+          value: deepest === null ? '—' : `${deepest.toFixed(1)}%`,
+          sub: deepest === null ? 'no drops yet' : 'vs previous check',
+          color: deepest === null ? null : 'var(--status-good)',
+        },
+      ]
+
+      return `
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-8">
+          ${tiles.map(t => `
+            <div class="rounded-lg border border-zinc-800 bg-zinc-900/40 px-4 py-3">
+              <div class="text-xs mb-1" style="color:var(--text-secondary)">${t.label}</div>
+              <div class="text-2xl font-semibold" style="color:${t.color || 'var(--text-primary)'}">${t.value}</div>
+              <div class="text-xs mt-0.5" style="color:var(--text-muted)">${t.sub}</div>
+            </div>`).join('')}
+        </div>`
+    }
+
+    function sorted() {
+      const rows = [...watches]
+      if (sortKey === 'change') {
+        const mag = w => (w.current && w.previous && w.previous.price)
+          ? Math.abs((w.current.price - w.previous.price) / w.previous.price) : -1
+        return rows.sort((a, b) => mag(b) - mag(a))
+      }
+      if (sortKey === 'price') {
+        return rows.sort((a, b) => (b.current?.price ?? -1) - (a.current?.price ?? -1))
+      }
+      return rows.sort((a, b) => a.label.localeCompare(b.label))
+    }
+
+    function render() {
+      const app = document.getElementById('app')
+
+      if (watches.length === 0) {
+        app.innerHTML = `
+          <h1 class="text-2xl font-semibold mb-2">Price Monitor</h1>
+          <p class="text-sm mb-8" style="color:var(--text-secondary)">
+            No watches configured yet.
+          </p>
+          <pre class="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4 text-sm overflow-x-auto"
+               style="color:var(--text-secondary)">npm run add -- "https://example.com/product" "Competitor A — Widget"
+npm run check</pre>`
+        return
+      }
+
+      const sortBtn = (key, label) => `
+        <button data-sort="${key}"
+          class="px-2.5 py-1 rounded text-xs transition-colors ${
+            sortKey === key ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'
+          }">${label}</button>`
+
+      app.innerHTML = `
+        <header class="flex items-baseline justify-between mb-6 flex-wrap gap-2">
+          <h1 class="text-2xl font-semibold">Price Monitor</h1>
+          <span class="text-xs" style="color:var(--text-muted)">
+            updated ${relTime(generatedAt)}
+          </span>
+        </header>
+
+        ${statTiles()}
+
+        <div class="flex items-center gap-1 mb-3">
+          <span class="text-xs mr-1" style="color:var(--text-muted)">Sort</span>
+          ${sortBtn('label', 'Name')}
+          ${sortBtn('change', 'Biggest move')}
+          ${sortBtn('price', 'Price')}
+        </div>
+
+        <div class="overflow-x-auto rounded-lg border border-zinc-800">
+          <table class="w-full text-left border-collapse">
+            <thead>
+              <tr class="text-xs" style="color:var(--text-secondary)">
+                <th class="font-medium px-4 py-2.5">Product</th>
+                <th class="font-medium px-4 py-2.5 text-right">Price</th>
+                <th class="font-medium px-4 py-2.5">Change</th>
+                <th class="font-medium px-4 py-2.5">Trend</th>
+                <th class="font-medium px-4 py-2.5">Stock</th>
+                <th class="font-medium px-4 py-2.5 text-right">Checked</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sorted().map(w => `
+                <tr class="border-t border-zinc-800/70 hover:bg-zinc-900/40 transition-colors">
+                  <td class="px-4 py-3">
+                    <a href="${w.url}" target="_blank" rel="noopener noreferrer"
+                       class="text-sm hover:underline">${w.label}</a>
+                    <div class="text-xs mt-0.5" style="color:var(--text-muted)">
+                      ${new URL(w.url).hostname.replace(/^www\./, '')}
+                    </div>
+                  </td>
+                  <td class="px-4 py-3 text-right text-sm tnum">
+                    ${fmtPrice(w.current?.price, w.current?.currency)}
+                  </td>
+                  <td class="px-4 py-3">${deltaCell(w)}</td>
+                  <td class="px-4 py-3">${sparkline(w.history, w.id)}</td>
+                  <td class="px-4 py-3">${stockCell(w)}</td>
+                  <td class="px-4 py-3 text-right text-xs" style="color:var(--text-muted)">
+                    ${relTime(w.current?.checkedAt)}
+                  </td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+
+        <div id="tooltip" class="fixed hidden pointer-events-none z-50 rounded-md border
+             border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs shadow-lg tnum"></div>`
+
+      attachHandlers()
+    }
+
+    function attachHandlers() {
+      document.querySelectorAll('[data-sort]').forEach(btn => {
+        btn.onclick = () => { sortKey = btn.dataset.sort; render() }
+      })
+
+      const tooltip = document.getElementById('tooltip')
+
+      document.querySelectorAll('svg[data-spark]').forEach(svg => {
+        const w = watches.find(x => x.id === svg.dataset.spark)
+        const pts = w.history.filter(h => h.price != null)
+        if (pts.length < 2) return
+
+        const crosshair = svg.querySelector('[data-crosshair]')
+        const marker = svg.querySelector('[data-marker]')
+        const W = svg.viewBox.baseVal.width
+        const H = svg.viewBox.baseVal.height
+        const PAD = 3
+
+        const prices = pts.map(p => p.price)
+        const min = Math.min(...prices)
+        const span = (Math.max(...prices) - min) || 1
+
+        svg.addEventListener('mousemove', e => {
+          const rect = svg.getBoundingClientRect()
+          // Map pointer position into viewBox units, then to the nearest index
+          const vx = ((e.clientX - rect.left) / rect.width) * W
+          const t = (vx - PAD) / (W - PAD * 2)
+          const i = Math.max(0, Math.min(pts.length - 1, Math.round(t * (pts.length - 1))))
+          const p = pts[i]
+
+          const px = PAD + (i / (pts.length - 1)) * (W - PAD * 2)
+          const py = PAD + (1 - (p.price - min) / span) * (H - PAD * 2)
+
+          crosshair.setAttribute('x1', px)
+          crosshair.setAttribute('x2', px)
+          crosshair.classList.remove('hidden')
+          marker.setAttribute('cx', px)
+          marker.setAttribute('cy', py)
+          marker.classList.remove('hidden')
+
+          tooltip.innerHTML = `
+            <div style="color:var(--text-primary)">${fmtPrice(p.price, w.current?.currency)}</div>
+            <div style="color:var(--text-secondary)">${new Date(p.checkedAt).toLocaleString()}</div>`
+          tooltip.classList.remove('hidden')
+          tooltip.style.left = `${rect.left + (px / W) * rect.width}px`
+          tooltip.style.top = `${rect.top - 8}px`
+          tooltip.style.transform = 'translate(-50%, -100%)'
+        })
+
+        svg.addEventListener('mouseleave', () => {
+          tooltip.classList.add('hidden')
+          crosshair.classList.add('hidden')
+          marker.classList.add('hidden')
+        })
+      })
+    }
+
+    async function load() {
+      const res = await fetch('/api/watches')
+      const data = await res.json()
+      watches = data.watches
+      generatedAt = data.generatedAt
+      render()
+    }
+
+    load()
+    setInterval(load, 60000)
+  </script>
+</body>
+</html>
