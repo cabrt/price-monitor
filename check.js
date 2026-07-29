@@ -28,7 +28,10 @@ async function checkWatch(watch, previous) {
     watchId: watch.id,
     checkedAt: new Date().toISOString(),
     price: result.price,
-    currency: result.currency || watch.currency || 'USD',
+    // No silent default: an unknown currency stays null and renders as a bare
+    // number, rather than mislabeling a £ price as $. Set "currency" on the
+    // watch when the page doesn't declare one (the regex path never does).
+    currency: result.currency || watch.currency || null,
     availability: result.availability,
     name: result.name,
     source: result.source,

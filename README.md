@@ -46,6 +46,31 @@ Served locally at `http://localhost:3457`. Stat tiles for the headline numbers, 
 
 Deltas and stock states pair a color with an arrow glyph and a text label. The green/red used for down/up is indistinguishable under deuteranopia (ΔE 4.1 measured against the chart surface), so color is never the only channel carrying the meaning.
 
+## MCP server
+
+The same data is exposed to an AI assistant over the [Model Context Protocol](https://modelcontextprotocol.io), so the monitor can be *asked* questions rather than read off a dashboard — "who undercut us this week?", "has Northgate ever been this cheap?", "start watching this URL."
+
+```bash
+claude mcp add price-monitor -- node /path/to/price-monitor/mcp-server.mjs
+```
+
+| Tool | What it answers |
+|---|---|
+| `list_watches` | Everything tracked, with current price, change, and stock |
+| `get_watch` | One product in detail plus its recent readings |
+| `price_history` | Time series over a window with low/high/net change |
+| `biggest_movers` | Ranked by absolute % change; filterable to `down` or `up` |
+| `summary` | How many repriced, how many out of stock, deepest cut |
+| `add_watch` | Start monitoring a URL |
+| `remove_watch` | Stop monitoring (history is retained) |
+| `check_now` | Fetch fresh prices immediately and report changes |
+
+Two details that matter in practice:
+
+**Products are addressed by name, not id.** `findWatch` resolves an id, an exact label, a unique partial label, or a URL fragment. An ambiguous query returns the candidate list rather than silently picking one — a monitor that guesses which competitor you meant is worse than one that asks.
+
+**`add_watch` takes a reading before it saves.** If the URL can't be read — no structured data, or robots.txt disallows it — the watch is never persisted and the failure is reported with the reason. Otherwise you'd accumulate watches that look fine and silently never produce data.
+
 ## Usage
 
 ```bash
@@ -57,6 +82,7 @@ npm run check -- --verbose    # include unchanged readings
 
 npm run watch                 # long-running, every CHECK_INTERVAL_MINUTES
 npm run dashboard             # http://localhost:3457
+npm run mcp                   # MCP server on stdio
 npm test
 ```
 
@@ -74,13 +100,16 @@ Watches live in `watches.json`:
       "id": "e5f6a7b8",
       "label": "Competitor B — Widget Pro",
       "url": "https://example.net/shop/widget-pro",
-      "priceRegex": "class=\"price\">\\$([0-9.,]+)"
+      "priceRegex": "class=\"price\">\\$([0-9.,]+)",
+      "currency": "GBP"
     }
   ]
 }
 ```
 
 `priceRegex` is only needed for sites that publish no structured data — check whether it's required by running `npm run check` first and seeing whether a price comes back.
+
+`currency` is optional and only read when the page doesn't declare one, which is always the case on the regex path. An undeclared currency stays unset and renders as a bare number rather than being defaulted to USD — mislabeling a £ price as $ is a worse failure than showing no symbol.
 
 Optional `.env`:
 
